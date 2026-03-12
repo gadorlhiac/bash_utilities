@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+
+# --- Hardware Health Checks ---
+# Looks at PSU, 12 V rail, CPU temps, total power draws, dmesg errors
+# Also looks at FPGA uptime via datadev driver.
+
+# Colors
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+CYAN="\033[0;36m"
+NC="\033[0m" # No Color
+
+echo -e "${CYAN}=========================================================${NC}"
+echo -e "${CYAN}           System Health Dashboard (LCLS-II DAQ)         ${NC}"
+echo -e "${CYAN}=========================================================${NC}"
+
+## Check presence and state of PSU(s)
+echo -e "\n[ PSU STATUS ]"
+PSU_DATA=$(sudo ipmitool sdr type "Power Supply" 2>/dev/null)
+if [[ -z "$PSU_DATA" ]]; then
+    echo -e "${RED}ERROR: Could not get PSU data via IPMI${NC}"
+else
+    echo "$PSU_DATA" | while read -r line; do
+        if echo "$line" | grep -qE "Failure|Lost|Predict_fail"; then
+            echo -e "${RED}[ ALERT ] $line${NC}"
+        else
+            echo -e "${GREEN}[ OK ] $line${NC}"
+        fi
+    done
+fi
+
+## Check 12 V rail
+echo -e "\n[ VOLTAGE RAILS ]"
+VOLT_12V=$(sudo ipmitool sdr | grep "12V" | awk '{print $3}')
+if [[ -z "$VOLT_12V" ]]; then
+    echo -e "${RED}ERROR: Could not get 12V rail data${NC}"
+else
+    # 12.6V is the 5% threshold
+    IS_HIGH=$(echo "$VOLT_12V > 12.60" | bc -l)
+    IS_CRIT=$(echo "$VOLT_12V > 13.00" | bc -l)
+
+    if [[ "$IS_CRIT" -eq 1 ]]; then
+        echo -e "${RED}[ CRITICAL ] 12V Rail is at ${VOLT_12V}V. DANGER OF HARDWARE DAMAGE!${NC}"
+    elif [[ "$IS_HIGH" -eq 1 ]]; then
+        echo -e "${YELLOW}[ WARNING ] 12V Rail is at ${VOLT_12V}V. (+5% Threshold Exceeded)${NC}"
+    else
+        echo -e "${GREEN}[ OK ] 12V Rail: ${VOLT_12V}V${NC}"
+    fi
+fi
+
+## Look at total system power
+echo -e "\n[ TOTAL POWER CONSUMPTION ]"
+
+# PSU info
+PSU_NAMES=($(sudo dmidecode -t 39 | grep -iE "Name" | awk '{print $2}'))
+PSU_MANUF=($(sudo dmidecode -t 39 | grep -iE "Manufacturer" | awk '{print $2}'))
+PSU_SERNO=($(sudo dmidecode -t 39 | grep -iE "Serial Number" | awk '{print $3}'))
+PSU_WCAPS=($(sudo dmidecode -t 39 | grep -iE "Max Power Capacity" | awk '{print $4}'))
+
+NUM_PSUS="${#PSU_NAMES[@]}"
+
+MAX_WATT=2000
+
+for PSU_IDX in $(seq 0 ${NUM_PSUS}); do
+    PSU_MANU="${PSU_MANUF[${PSU_IDX}]}"
+    PSU_NAME="${PSU_NAMES[${PSU_IDX}]}"
+    PSU_SRNO="${PSU_SERNO[${PSU_IDX}]}"
+    PSU_WCAP="${PSU_WCAPS[${PSU_IDX}]}"
+    if [[ -n "${PSU_MANU}" ]]; then
+        echo -e "${PSU_MANU} Power Supply ${PSU_NAME} (S/N ${PSU_SRNO}) Max Capacity: ${PSU_WCAP} W"
+
+        # Update max wattage
+        if [[ "${PSU_WCAP}" -gt "${MAX_WATT}" ]]; then
+            MAX_WATT=${PSU_WCAP}
+        fi
+    fi
+done
+
+# Set alert for 90% and a notice for 60%
+ALERT_WATT=$(echo "${MAX_WATT}*0.9" | bc -l)
+NOTICE_WATT=$(echo "${MAX_WATT}*0.6" | bc -l)
+
+# Current draw
+POWER_WATTS=$(sudo ipmitool dcmi power reading 2>/dev/null | grep "Instantaneous power reading" | awk '{print $4}')
+if [[ -z "$POWER_WATTS" ]]; then
+    POWER_WATTS=$(sensors | grep "power1:" | awk '{print $2 * 1000}' | cut -d'.' -f1)
+fi
+if [[ -n "$POWER_WATTS" ]]; then
+    if [[ "$POWER_WATTS" -gt "${ALERT_WATT%.*}" ]]; then
+        echo -e "${RED}[ ALERT ] Total Power: ${POWER_WATTS} W (Approaching ${MAX_WATT} W PSU limit!)${NC}"
+    elif [[ "$POWER_WATTS" -gt "${NOTICE_WATT%.*}" ]]; then
+        echo -e "${YELLOW}[ NOTICE ] Total Power: ${POWER_WATTS} W (High Load)${NC}"
+    else
+        echo -e "${GREEN}[ OK ] Total Power: ${POWER_WATTS} W (Healthy for ${MAX_WATT} W Chassis)${NC}"
+    fi
+fi
+
+## Check critical events in ipmitool sel list
+## Translate the UTC time output to local time
+echo -e "\n[ RECENT CRITICAL EVENTS (Local Time) ]"
+
+sudo ipmitool sel list | tail -n 20 | grep -iE "Critical|IERR|Uncorrectable|Asserted" | while read -r line; do
+    RAW_DATE=$(echo "$line" | awk -F'|' '{print $2}')
+    RAW_TIME=$(echo "$line" | awk -F'|' '{print $3}')
+    DESC=$(echo "$line" | awk -F'|' '{print $4 " | " $5 " | " $6}')
+
+    # Translate UTC to Local
+    LOCAL_DATE=$(date -d "${RAW_DATE} ${RAW_TIME} UTC" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+    if [[ -n "$LOCAL_DATE" ]]; then
+        echo -e "${RED}[ ALERT ] ${LOCAL_DATE} | ${DESC}${NC}"
+    else
+        echo -e "${RED}[ ALERT ] ${line}${NC}"
+    fi
+done
+
+## Look at CPU temperatures
+echo -e "\n[ CPU TEMPERATURES ]"
+sensors | grep -E "Package|Core" | head -n 4
+
+## Look at fans
+echo -e "\n[ Fan STATUS ]"
+PSU_DATA=$(sudo ipmitool sdr type "Fan" 2>/dev/null)
+if [[ -z "$PSU_DATA" ]]; then
+    echo -e "${RED}ERROR: Could not get fan data via IPMI${NC}"
+else
+    echo "$PSU_DATA" | while read -r line; do
+        if echo "$line" | grep -qE "Failure|Lost|Predict_fail"; then
+            echo -e "${RED}[ ALERT ] $line${NC}"
+        else
+            echo -e "${GREEN}[ OK ] $line${NC}"
+        fi
+    done
+fi
+
+
+## FPGA status (datadev)
+echo -e "\n[ FPGA CARD UPTIME (datadev) ]"
+for proc_file in /proc/datadev_*; do
+    if [[ -f "$proc_file" ]]; then
+        DEV_NAME=$(basename "$proc_file")
+        UPTIME=$(grep "Up Time Count" "$proc_file" | awk '{print $5}')
+        BUILD=$(grep "Build String" "$proc_file" | cut -d':' -f2-)
+        echo -e "${CYAN}$DEV_NAME:${NC} Uptime: ${UPTIME}s | ID: ${BUILD# }"
+    fi
+done
+
+## Raid status
+echo -e "\n[ RAID STATUS (mdadm) ]"
+for array in /dev/md*; do
+    if [[ -b "$array" ]]; then
+        STATE=$(sudo mdadm --detail "$array" | grep "State :" | awk -F': ' '{print $2}')
+        if [[ "$STATE" == *"clean"* || "$STATE" == *"active"* ]]; then
+            echo -e "${GREEN}[ OK ] $array: $STATE${NC}"
+        else
+            echo -e "${RED}[ ALERT ] $array: $STATE${NC}"
+        fi
+    fi
+done
+
+## Look at dmesg errors
+## There is a `--since` flag, but not all versions support it
+echo -e "\n[ DMESG ERROR TICKER (Last 30m) ]"
+ERR_COUNT=$(dmesg | tail -n 1000 | grep -iE "Hardware Error|Uncorrectable|Critical|IERR|SLVERR" | wc -l)
+if [[ "$ERR_COUNT" -gt 0 ]]; then
+    echo -e "${RED}[ ALERT ] ${ERR_COUNT} critical messages found in dmesg (last 1000 lines)!${NC}"
+    dmesg | tail -n 1000 | grep -iE "Hardware Error|Uncorrectable|Critical|IERR|SLVERR" | tail -n 5 | sed 's/^/\t/'
+else
+    echo -e "${GREEN}[ OK ] No critical hardware messages in recent dmesg logs${NC}"
+
+    # Double check in case some other error is there.
+    # This is erroneous -- need a better grep
+    # echo -e "\n[ (Non-hardware) DMESG ERROR TICKER (Last 30m) ]"
+    # ERR_COUNT=$(dmesg | tail -n 1000 | grep -iE "Error" | wc -l)
+    # if [[ "$ERR_COUNT" -gt 0 ]]; then
+    #     echo -e "${YELLOW}[ NOTICE ] ${ERR_COUNT} error messages found in dmesg (last 1000 lines)!${NC}"
+    #     dmesg | tail -n 1000 | grep -iE "Error" | tail -n 5 | sed 's/^/\t/'
+    # else
+    #     echo -e "${GREEN}[ OK ] No error messages in recent dmesg logs${NC}"
+    # fi
+fi
+echo -e "\n${CYAN}=========================================================${NC}"
